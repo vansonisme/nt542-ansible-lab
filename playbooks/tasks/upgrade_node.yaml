@@ -1,0 +1,90 @@
+---
+- name: Check current MongoDB version
+  ansible.builtin.command: mongod --version
+  register: version_before
+  changed_when: false
+
+- name: Upgrade MongoDB binaries if node is not on target version
+  when: ('db version v' ~ mongodb_target_major ~ '.') not in version_before.stdout
+  block:
+    - name: Stop mongod
+      ansible.builtin.systemd:
+        name: mongod
+        state: stopped
+
+    - name: Remove old MongoDB apt repository
+      ansible.builtin.file:
+        path: "/etc/apt/sources.list.d/mongodb-org-{{ mongodb_major }}.list"
+        state: absent
+
+    - name: Import target MongoDB GPG key
+      ansible.builtin.get_url:
+        url: "https://pgp.mongodb.com/server-{{ mongodb_target_major }}.asc"
+        dest: "/etc/apt/keyrings/mongodb-server-{{ mongodb_target_major }}.asc"
+        mode: "0644"
+
+    - name: Add target MongoDB apt repository
+      ansible.builtin.copy:
+        dest: "/etc/apt/sources.list.d/mongodb-org-{{ mongodb_target_major }}.list"
+        mode: "0644"
+        content: >-
+          deb [ arch=amd64,arm64 signed-by=/etc/apt/keyrings/mongodb-server-{{ mongodb_target_major }}.asc ]
+          https://repo.mongodb.org/apt/ubuntu {{ mongodb_repo_codename }}/mongodb-org/{{ mongodb_target_major }} multiverse
+
+    - name: Unhold MongoDB packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop: "{{ mongodb_pkgs }}"
+
+    - name: Install target MongoDB version
+      ansible.builtin.apt:
+        name: "{{ mongodb_pkgs if mongodb_target_full == '' else (mongodb_pkgs | map('regex_replace', '$', '=' ~ mongodb_target_full) | list) }}"
+        update_cache: true
+        state: "{{ 'latest' if mongodb_target_full == '' else 'present' }}"
+
+    - name: Hold MongoDB packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: "{{ mongodb_pkgs }}"
+
+    - name: Start mongod
+      ansible.builtin.systemd:
+        name: mongod
+        state: started
+        daemon_reload: true
+
+- name: Wait for mongod to listen
+  ansible.builtin.wait_for:
+    port: "{{ mongodb_port }}"
+    delay: 2
+    timeout: 120
+
+- name: Wait for node to rejoin the replica set and catch up
+  ansible.builtin.command:
+    argv: "{{ mongosh_auth + ['--eval', catchup_js] }}"
+  vars:
+    catchup_js: |
+      const s = rs.status();
+      const me = s.members.find(x => x.self);
+      const p = s.members.find(x => x.state === 1);
+      const lag = p ? (p.optimeDate - me.optimeDate) / 1000 : 999;
+      print((me.state === 1 || (me.state === 2 && lag <= 10)) ? "OK" : "WAIT");
+      print(me.name + "  " + me.stateStr + "  lag=" + lag + "s");
+  register: catchup
+  until: catchup.stdout.startswith('OK')
+  retries: 60
+  delay: 5
+  changed_when: false
+  no_log: true
+
+- name: Confirm version after upgrade
+  ansible.builtin.command: mongod --version
+  register: version_after
+  changed_when: false
+  failed_when: ('db version v' ~ mongodb_target_major ~ '.') not in version_after.stdout
+
+- name: Show upgraded version
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: {{ version_after.stdout_lines[0] }}"

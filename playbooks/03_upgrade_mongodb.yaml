@@ -1,0 +1,186 @@
+---
+- name: Pre-upgrade checks
+  hosts: mongodb
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  tasks:
+    - name: Wait for mongod to listen
+      ansible.builtin.wait_for:
+        port: "{{ mongodb_port }}"
+        timeout: 30
+
+    - name: Read current MongoDB version on every node
+      ansible.builtin.command: mongod --version
+      register: version_before_upgrade
+      changed_when: false
+
+    - name: Require all nodes to start on MongoDB 6.0
+      ansible.builtin.assert:
+        that:
+          - "('db version v' ~ mongodb_major ~ '.') in version_before_upgrade.stdout"
+        fail_msg: "This rolling upgrade expects every member to start on MongoDB {{ mongodb_major }}."
+
+    - name: Verify cluster health
+      ansible.builtin.command:
+        argv: "{{ mongosh_auth + ['--eval', mongodb_health_js] }}"
+      run_once: true
+      register: pre_health
+      failed_when: not pre_health.stdout.startswith('HEALTHY')
+      changed_when: false
+      no_log: true
+
+    - name: Get current feature compatibility version
+      ansible.builtin.command:
+        argv: "{{ mongosh_auth + ['--eval', fcv_js] }}"
+      vars:
+        fcv_js: |
+          print(db.adminCommand({getParameter: 1, featureCompatibilityVersion: 1}).featureCompatibilityVersion.version);
+      run_once: true
+      register: fcv_before
+      changed_when: false
+      no_log: true
+
+    - name: Require FCV 6.0 before upgrading
+      ansible.builtin.assert:
+        that: fcv_before.stdout | trim == '6.0'
+        fail_msg: "Current FCV is not 6.0, aborting upgrade"
+      run_once: true
+
+    - name: Detect which node is the Primary
+      ansible.builtin.command:
+        argv: [mongosh, --quiet, --port, "{{ mongodb_port }}", --eval, "print(db.hello().isWritablePrimary)"]
+      register: is_primary
+      changed_when: false
+
+    - name: Group nodes by replica set role
+      ansible.builtin.group_by:
+        key: "mongo_{{ 'primary' if is_primary.stdout | trim == 'true' else 'secondary' }}"
+
+- name: Upgrade Secondaries one at a time
+  hosts: mongo_secondary
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Upgrade node
+      ansible.builtin.include_tasks: tasks/upgrade_node.yaml
+
+- name: Step down Primary and upgrade it last
+  hosts: mongo_primary
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Step down the Primary
+      ansible.builtin.command:
+        argv: "{{ mongosh_auth + ['--eval', stepdown_js] }}"
+      vars:
+        stepdown_js: |
+          try { rs.stepDown(120, 30); } catch (e) { print("stepdown command sent"); }
+      no_log: true
+
+    - name: Wait until this node is no longer Primary
+      ansible.builtin.command:
+        argv: [mongosh, --quiet, --port, "{{ mongodb_port }}", --eval, "print(db.hello().isWritablePrimary)"]
+      register: after_stepdown
+      until: after_stepdown.stdout | trim == 'false'
+      retries: 20
+      delay: 3
+      changed_when: false
+
+    - name: Wait for a new Primary to be elected
+      ansible.builtin.command:
+        argv: "{{ mongosh_auth + ['--eval', hello_js] }}"
+      vars:
+        hello_js: |
+          print(db.hello().primary || "none");
+        old_addr: "{{ ansible_default_ipv4.address ~ ':' ~ mongodb_port }}"
+      delegate_to: "{{ groups['mongo_secondary'][0] }}"
+      register: new_primary
+      until: new_primary.stdout | trim not in ['none', old_addr]
+      retries: 20
+      delay: 3
+      changed_when: false
+      no_log: true
+
+    - name: Upgrade node (former Primary)
+      ansible.builtin.include_tasks: tasks/upgrade_node.yaml
+
+- name: Verify all members run the target MongoDB major version
+  hosts: mongodb
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Read MongoDB version
+      ansible.builtin.command: mongod --version
+      register: target_version
+      changed_when: false
+
+    - name: Require target version on every member
+      ansible.builtin.assert:
+        that:
+          - "('db version v' ~ mongodb_target_major ~ '.') in target_version.stdout"
+        fail_msg: "{{ inventory_hostname }} is not running MongoDB {{ mongodb_target_major }}; FCV will not be changed."
+
+- name: Finalize - raise feature compatibility version
+  hosts: mongodb[0]
+  become: true
+  gather_facts: false
+  vars:
+    rs_hosts: "{{ groups['mongodb'] | map('extract', hostvars, ['ansible_default_ipv4', 'address']) | map('regex_replace', '$', ':' ~ mongodb_port) | list | join(',') }}"
+    mongosh_rs:
+      - mongosh
+      - --quiet
+      - "mongodb://{{ rs_hosts }}/admin?replicaSet={{ mongodb_replset }}"
+      - -u
+      - "{{ mongodb_admin_user }}"
+      - -p
+      - "{{ mongodb_admin_password }}"
+      - --authenticationDatabase
+      - admin
+  tasks:
+    - name: Verify cluster health before raising FCV
+      ansible.builtin.command:
+        argv: "{{ mongosh_rs + ['--eval', mongodb_health_js] }}"
+      register: post_health
+      failed_when: not post_health.stdout.startswith('HEALTHY')
+      changed_when: false
+      no_log: true
+
+    - name: Set feature compatibility version to target
+      ansible.builtin.command:
+        argv: "{{ mongosh_rs + ['--eval', setfcv_js] }}"
+      vars:
+        setfcv_js: |
+          printjson(db.adminCommand({setFeatureCompatibilityVersion: "{{ mongodb_target_major }}", confirm: true}));
+      when: set_fcv | default(true) | bool
+      no_log: true
+
+    - name: Read back feature compatibility version
+      ansible.builtin.command:
+        argv: "{{ mongosh_rs + ['--eval', fcv_js] }}"
+      vars:
+        fcv_js: |
+          print(db.adminCommand({getParameter: 1, featureCompatibilityVersion: 1}).featureCompatibilityVersion.version);
+      register: fcv_after
+      changed_when: false
+      no_log: true
+
+    - name: Show feature compatibility version
+      ansible.builtin.debug:
+        msg: "FCV = {{ fcv_after.stdout | trim }}"
+
+- name: Final version summary
+  hosts: mongodb
+  gather_facts: false
+  tasks:
+    - name: Get MongoDB version
+      ansible.builtin.command: mongod --version
+      register: version_final
+      changed_when: false
+
+    - name: Show MongoDB version
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ version_final.stdout_lines[0] }}"

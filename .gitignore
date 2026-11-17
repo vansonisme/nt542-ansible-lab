@@ -1,0 +1,3 @@
+playbooks/mongo-keyfile
+*.pem
+.venv/

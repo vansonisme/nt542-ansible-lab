@@ -91,3 +91,30 @@ ansible-playbook playbooks/01_install_mongodb.yaml
 # Bước 2: Cấu hình Replica Set và bảo mật keyfile
 ansible-playbook playbooks/02_replica_set_config.yaml
 ```
+
+### 8. Rolling upgrade from MongoDB 6.0 to 7.0
+
+After Question 1 is complete, confirm that every member runs MongoDB 6.0,
+the replica set has one PRIMARY and four healthy SECONDARY members, and FCV is
+6.0. Before running the playbook, load the existing admin password into the WSL environment without putting it in shell history:
+
+    read -rsp "MongoDB admin password: " MONGODB_ADMIN_PASSWORD; export MONGODB_ADMIN_PASSWORD; printf "\\n"
+
+Then run the Question 2 playbook:
+
+    ansible-playbook playbooks/03_upgrade_mongodb.yaml
+
+The playbook checks cluster health and the starting version, discovers the
+current Primary, upgrades Secondaries one at a time, steps down and upgrades
+the former Primary last, waits for each member to rejoin, verifies all five
+binaries are on MongoDB 7.0, then raises FCV to 7.0. The demonstrated patch
+version is pinned in group_vars/mongodb.yaml.
+
+Do not rerun the initial installation or replica-set playbooks as part of this
+rolling upgrade. Check replica-set health and versions after the play completes.
+
+Platform note: the provided CloudFormation template creates Ubuntu 24.04
+instances and the lab uses MongoDB 7.0 packages from the Jammy repository.
+MongoDB's official platform matrix does not list MongoDB 7.0 on Ubuntu 24.04;
+this setup is for the course exercise and is not an officially supported
+production combination.
