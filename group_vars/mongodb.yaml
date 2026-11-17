@@ -8,7 +8,7 @@ mongodb_replset: rs0
 mongodb_keyfile: /etc/mongodb/mongo-keyfile
 
 mongodb_admin_user: admin
-mongodb_admin_password: "23521357"
+mongodb_admin_password: "{{ lookup('env', 'MONGODB_ADMIN_PASSWORD') }}"
 
 mongodb_pkgs:
   - mongodb-org
@@ -31,3 +31,15 @@ mongosh_auth:
   - --authenticationDatabase
   - admin
 
+
+mongodb_target_major: "7.0"
+mongodb_target_full: "7.0.48"
+
+mongodb_health_js: |
+  const m = rs.status().members;
+  const n = {{ groups['mongodb'] | length }};
+  const ok = m.length === n && m.every(x => x.health === 1)
+             && m.filter(x => x.state === 1).length === 1
+             && m.filter(x => x.state === 2).length === n - 1;
+  print(ok ? "HEALTHY" : "UNHEALTHY");
+  m.forEach(x => print(x.name + "  " + x.stateStr + "  health=" + x.health));
