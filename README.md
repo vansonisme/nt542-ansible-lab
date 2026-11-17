@@ -4,7 +4,8 @@ Dự án tự động hóa triển khai cơ sở hạ tầng cụm MongoDB Repli
 
 ## 🗂️ Cấu trúc thư mục dự án
 
-```
+```text
+├── .env.example
 ├── add_ssh.py
 ├── ansible.cfg
 ├── group_vars
@@ -15,13 +16,14 @@ Dự án tự động hóa triển khai cơ sở hạ tầng cụm MongoDB Repli
 └── playbooks
     ├── 01_install_mongodb.yaml
     ├── 02_replica_set_config.yaml
+    └── 03_upgrade_mongodb.yaml
 ```
 
 ## 🚀 Hướng dẫn cài đặt và triển khai chi tiết
 
 ### 1. Clone dự án và di chuyển vào thư mục làm việc
 
-```
+```bash
 git clone https://github.com/vansonisme/nt542-ansible-lab && cd nt542-ansible-lab
 ```
 
@@ -29,7 +31,7 @@ git clone https://github.com/vansonisme/nt542-ansible-lab && cd nt542-ansible-la
 
 Tạo và kích hoạt môi trường ảo Python để chạy các script tự động hóa:
 
-```
+```bash
 # Tạo môi trường ảo
 python3 -m venv .venv
 
@@ -40,11 +42,25 @@ source .venv/bin/activate
 pip install boto3
 ```
 
-### 3. Triển khai hạ tầng AWS CloudFormation
+### 3. Cấu hình biến môi trường (`.env`)
+
+Tạo file `.env` từ file mẫu và điền mật khẩu quản trị MongoDB của bạn:
+
+```bash
+cp .env.example .env
+```
+
+Mở file `.env` và cập nhật giá trị `MONGODB_ADMIN_PASSWORD`:
+
+```env
+MONGODB_ADMIN_PASSWORD="<your-admin-password>"
+```
+
+### 4. Triển khai hạ tầng AWS CloudFormation
 
 Triển khai cụm máy chủ ảo từ template có sẵn bằng AWS CLI:
 
-```
+```bash
 aws cloudformation deploy \
   --template-file infrastructure/mongodb-cluster.yaml \
   --stack-name mongodb-cluster \
@@ -52,27 +68,27 @@ aws cloudformation deploy \
   --parameter-overrides KeyName=<your-key-pair-name>
 ```
 
-### 4. Cấu hình quyền cho file khóa (PEM)
+### 5. Cấu hình quyền cho file khóa (PEM)
 
 Đảm bảo file private key đúng quyền bảo mật yêu cầu của SSH:
 
-```
+```bash
 chmod 400 <key-pair-path>
 ```
 
-### 5. Tự động cập nhật file `~/.ssh/config`
+### 6. Tự động cập nhật file `~/.ssh/config`
 
 Chạy script Python để tự động lấy danh sách IP Public mới nhất từ AWS CloudFormation và ghi đè vào cấu hình SSH:
 
-```
+```bash
 python3 add_ssh.py --stack mongodb-cluster --identity_file <key-pair-path>
 ```
 
-### 6. Kiểm tra kết nối SSH và Ansible
+### 7. Kiểm tra kết nối SSH và Ansible
 
 Kiểm tra kết nối trực tiếp qua SSH hoặc kiểm tra toàn bộ cụm bằng Ansible:
 
-```
+```bash
 # Kiểm tra SSH vào từng node (mongodb1 -> mongodb5)
 ssh mongodb1
 
@@ -80,11 +96,11 @@ ssh mongodb1
 ansible all -m ping
 ```
 
-### 7. Chạy Ansible Playbooks để cài đặt và cấu hình MongoDB
+### 8. Chạy Ansible Playbooks để cài đặt và cấu hình MongoDB
 
 Thực thi lần lượt các playbook để cài đặt MongoDB và khởi tạo cụm Replica Set:
 
-```
+```bash
 # Bước 1: Cài đặt MongoDB trên các node
 ansible-playbook playbooks/01_install_mongodb.yaml
 
@@ -92,29 +108,28 @@ ansible-playbook playbooks/01_install_mongodb.yaml
 ansible-playbook playbooks/02_replica_set_config.yaml
 ```
 
-### 8. Rolling upgrade from MongoDB 6.0 to 7.0
+### 9. Nâng cấp cuốn chiếu (Rolling Upgrade) từ MongoDB 6.0 lên 7.0
 
-After Question 1 is complete, confirm that every member runs MongoDB 6.0,
-the replica set has one PRIMARY and four healthy SECONDARY members, and FCV is
-6.0. Before running the playbook, load the existing admin password into the WSL environment without putting it in shell history:
+Sau khi hoàn tất bước cài đặt ban đầu, hãy đảm bảo tất cả các node đều đang chạy MongoDB 6.0, cụm Replica Set có 1 node `PRIMARY` cùng 4 node `SECONDARY` hoạt động ổn định, và mức tương thích tính năng (`FCV`) đang là `6.0`. 
 
-    read -rsp "MongoDB admin password: " MONGODB_ADMIN_PASSWORD; export MONGODB_ADMIN_PASSWORD; printf "\\n"
+Trước khi chạy playbook nâng cấp, nạp biến môi trường từ file `.env` đã cấu hình ở Bước 3 vào phiên làm việc hiện tại:
 
-Then run the Question 2 playbook:
+```bash
+set -a && source .env && set +a
+```
 
-    ansible-playbook playbooks/03_upgrade_mongodb.yaml
+Sau đó, chạy playbook nâng cấp:
 
-The playbook checks cluster health and the starting version, discovers the
-current Primary, upgrades Secondaries one at a time, steps down and upgrades
-the former Primary last, waits for each member to rejoin, verifies all five
-binaries are on MongoDB 7.0, then raises FCV to 7.0. The demonstrated patch
-version is pinned in group_vars/mongodb.yaml.
+```bash
+ansible-playbook playbooks/03_upgrade_mongodb.yaml
+```
 
-Do not rerun the initial installation or replica-set playbooks as part of this
-rolling upgrade. Check replica-set health and versions after the play completes.
+**Cơ chế hoạt động của playbook:**
+* Kiểm tra tình trạng cụm và phiên bản hiện tại.
+* Xác định node `PRIMARY` hiện hành.
+* Nâng cấp lần lượt từng node `SECONDARY`, sau đó thực hiện hạ cấp (step down) và nâng cấp node `PRIMARY` cũ sau cùng.
+* Chờ từng node gia nhập lại cụm sau khi nâng cấp, xác minh cả 5 node đều đã lên MongoDB 7.0 (phiên bản cụ thể được ghim trong `group_vars/mongodb.yaml`), rồi mới nâng `FCV` lên `7.0`.
 
-Platform note: the provided CloudFormation template creates Ubuntu 24.04
-instances and the lab uses MongoDB 7.0 packages from the Jammy repository.
-MongoDB's official platform matrix does not list MongoDB 7.0 on Ubuntu 24.04;
-this setup is for the course exercise and is not an officially supported
-production combination.
+> **Lưu ý:** 
+> * **Không** chạy lại các playbook cài đặt ban đầu (`01` và `02`) trong quá trình nâng cấp này. Hãy kiểm tra lại trạng thái cụm và phiên bản trên các node sau khi playbook hoàn tất.
+> * **Tương thích hệ điều hành:** Template CloudFormation sử dụng Ubuntu 24.04 trong khi bài lab cài đặt gói MongoDB 7.0 từ repository của Ubuntu 22.04 (Jammy). Bảng hỗ trợ chính thức của MongoDB không liệt kê MongoDB 7.0 trên Ubuntu 24.04; cấu hình này chỉ phục vụ mục đích thực hành môn học, không khuyến nghị dùng cho môi trường production.
