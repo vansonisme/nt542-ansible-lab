@@ -1,0 +1,129 @@
+---
+- name: Generate replica-set keyfile on the control node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create keyfile once (shared by all members for internal auth)
+      ansible.builtin.shell: |
+        openssl rand -base64 756 > "{{ playbook_dir }}/mongo-keyfile"
+        chmod 400 "{{ playbook_dir }}/mongo-keyfile"
+      args:
+        creates: "{{ playbook_dir }}/mongo-keyfile"
+
+- name: Install and configure MongoDB
+  hosts: mongodb
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name: [gnupg, curl, ca-certificates]
+        update_cache: true
+        state: present
+
+    - name: Ensure apt keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Import MongoDB GPG key
+      ansible.builtin.get_url:
+        url: "https://pgp.mongodb.com/server-{{ mongodb_major }}.asc"
+        dest: "/etc/apt/keyrings/mongodb-server-{{ mongodb_major }}.asc"
+        mode: "0644"
+
+    - name: Add MongoDB apt repository
+      ansible.builtin.copy:
+        dest: "/etc/apt/sources.list.d/mongodb-org-{{ mongodb_major }}.list"
+        mode: "0644"
+        content: >-
+          deb [ arch=amd64,arm64 signed-by=/etc/apt/keyrings/mongodb-server-{{ mongodb_major }}.asc ]
+          https://repo.mongodb.org/apt/ubuntu {{ mongodb_repo_codename }}/mongodb-org/{{ mongodb_major }} multiverse
+
+    - name: Install MongoDB
+      ansible.builtin.apt:
+        name: "{{ mongodb_pkgs if mongodb_full == '' else (mongodb_pkgs | map('regex_replace', '$', '=' ~ mongodb_full) | list) }}"
+        update_cache: true
+        state: present
+
+    - name: Hold packages (avoid accidental upgrades)
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: "{{ mongodb_pkgs }}"
+
+    - name: Create keyfile directory
+      ansible.builtin.file:
+        path: "{{ mongodb_keyfile | dirname }}"
+        state: directory
+        owner: mongodb
+        group: mongodb
+        mode: "0750"
+
+    - name: Copy keyfile to node
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/mongo-keyfile"
+        dest: "{{ mongodb_keyfile }}"
+        owner: mongodb
+        group: mongodb
+        mode: "0400"
+      notify: Restart mongod
+
+    - name: Configure mongod.conf (same on every node)
+      ansible.builtin.copy:
+        dest: /etc/mongod.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible
+          storage:
+            dbPath: /var/lib/mongodb
+          systemLog:
+            destination: file
+            logAppend: true
+            path: /var/log/mongodb/mongod.log
+          net:
+            port: {{ mongodb_port }}
+            bindIp: 0.0.0.0
+          processManagement:
+            timeZoneInfo: /usr/share/zoneinfo
+          security:
+            keyFile: {{ mongodb_keyfile }}
+            authorization: enabled
+          replication:
+            replSetName: {{ mongodb_replset }}
+      notify: Restart mongod
+
+    - name: Enable and start mongod
+      ansible.builtin.systemd:
+        name: mongod
+        state: started
+        enabled: true
+
+    - name: Apply pending restarts now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for mongod to listen
+      ansible.builtin.wait_for:
+        port: "{{ mongodb_port }}"
+        delay: 2
+        timeout: 60
+
+    - name: Confirm installed version
+      ansible.builtin.command: mongod --version
+      register: mongod_ver
+      changed_when: false
+
+    - name: Show version
+      ansible.builtin.debug:
+        msg: "{{ mongod_ver.stdout_lines[0] }}"
+
+  handlers:
+    - name: Restart mongod
+      ansible.builtin.systemd:
+        name: mongod
+        state: restarted
+

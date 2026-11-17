@@ -1,0 +1,33 @@
+---
+mongodb_major: "6.0"
+mongodb_full: "6.0.19"        
+mongodb_repo_codename: jammy
+
+mongodb_port: 27017
+mongodb_replset: rs0
+mongodb_keyfile: /etc/mongodb/mongo-keyfile
+
+mongodb_admin_user: admin
+mongodb_admin_password: "23521357"
+
+mongodb_pkgs:
+  - mongodb-org
+  - mongodb-org-database
+  - mongodb-org-server
+  - mongodb-org-mongos
+  - mongodb-org-tools
+
+mongodb_host_list: "{{ groups['mongodb'] | map('extract', hostvars, 'ansible_host') | map('regex_replace', '$', ':' ~ mongodb_port) | list }}"
+
+mongosh_auth:
+  - mongosh
+  - --quiet
+  - --port
+  - "{{ mongodb_port }}"
+  - -u
+  - "{{ mongodb_admin_user }}"
+  - -p
+  - "{{ mongodb_admin_password }}"
+  - --authenticationDatabase
+  - admin
+

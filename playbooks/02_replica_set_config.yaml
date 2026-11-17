@@ -1,0 +1,100 @@
+---
+# PLAYBOOK 2/2 - Initialize the Replica Set, create admin, verify cluster health
+# Run AFTER 01_install_configure.yml:  ansible-playbook -i inventory.ini 02_init_replicaset.yml
+
+- name: Pre-check - mongod is listening on every node
+  hosts: mongodb
+  become: true
+  gather_facts: true        # needed: we read each node's private IP from its facts
+  tasks:
+    - name: Wait for port
+      ansible.builtin.wait_for:
+        port: "{{ mongodb_port }}"
+        timeout: 30
+
+- name: Initialize Replica Set and verify (from first node only)
+  hosts: mongodb[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Check whether the replica set is already initiated
+      ansible.builtin.command:
+        argv: [mongosh, --quiet, --port, "{{ mongodb_port }}", --eval, "print(db.hello().setName || 'none')"]
+      register: rs_name
+      changed_when: false
+
+    - name: Build member list from each node's PRIVATE IP (reachable by all nodes inside the VPC)
+      ansible.builtin.set_fact:
+        host_list: "{{ host_list | default([]) + [hostvars[item].ansible_default_ipv4.address ~ ':' ~ mongodb_port] }}"
+      loop: "{{ groups['mongodb'] }}"
+
+    - name: rs.initiate() with all 5 members (node 1 = priority 2)
+      ansible.builtin.command:
+        argv:
+          - mongosh
+          - --quiet
+          - --port
+          - "{{ mongodb_port }}"
+          - --eval
+          - |
+            const hosts = {{ host_list | to_json }};
+            printjson(rs.initiate({
+              _id: "{{ mongodb_replset }}",
+              members: hosts.map((h, i) => ({ _id: i, host: h, priority: i === 0 ? 2 : 1 }))
+            }));
+      when: rs_name.stdout | trim != mongodb_replset
+
+    - name: Wait until node 1 is PRIMARY
+      ansible.builtin.command:
+        argv: [mongosh, --quiet, --port, "{{ mongodb_port }}", --eval, "print(db.hello().isWritablePrimary)"]
+      register: primary_up
+      until: primary_up.stdout | trim == 'true'
+      retries: 30
+      delay: 3
+      changed_when: false
+
+    - name: Can we already log in as admin?
+      ansible.builtin.command:
+        argv: "{{ mongosh_auth + ['--eval', 'print(\"login-ok\")'] }}"
+      register: admin_check
+      failed_when: false
+      changed_when: false
+      no_log: true
+
+    - name: Create admin user (localhost exception, first run only)
+      ansible.builtin.command:
+        argv:
+          - mongosh
+          - --quiet
+          - --port
+          - "{{ mongodb_port }}"
+          - --eval
+          - >-
+            db.getSiblingDB("admin").createUser({user: "{{ mongodb_admin_user }}",
+            pwd: "{{ mongodb_admin_password }}", roles: [{role: "root", db: "admin"}]})
+      when: "'login-ok' not in admin_check.stdout"
+      no_log: true
+
+    - name: Verify cluster health (1 PRIMARY + 4 SECONDARY, health=1)
+      ansible.builtin.command:
+        argv: "{{ mongosh_auth + ['--eval', health_js] }}"
+      vars:
+        health_js: |
+          const m = rs.status().members;
+          const n = {{ groups['mongodb'] | length }};
+          const ok = m.length === n && m.every(x => x.health === 1)
+                     && m.filter(x => x.state === 1).length === 1
+                     && m.filter(x => x.state === 2).length === n - 1;
+          print(ok ? "HEALTHY" : "UNHEALTHY");
+          m.forEach(x => print(x.name + "  " + x.stateStr + "  health=" + x.health));
+      register: cluster_health
+      until: cluster_health.stdout.startswith('HEALTHY')
+      retries: 30
+      delay: 10
+      changed_when: false
+      no_log: true
+
+    - name: Show cluster members
+      ansible.builtin.debug:
+        msg: "{{ cluster_health.stdout_lines }}"
+
